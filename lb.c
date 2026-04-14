@@ -11,6 +11,7 @@
 // upstream_server_ips
 struct endpoints {
   __u32 ip;
+  __u16 port;
 };
 
 struct {
@@ -46,7 +47,7 @@ struct conn_key {
 // LRU automatically evicts oldest entry when full, no explicit TTL needed
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 65536);
+  __uint(max_entries, 65536); //for source port of the tcp connection(different per each request) 
   __type(key, struct conn_key);
   __type(value, __u32);
 } conntrack SEC(".maps");
@@ -190,11 +191,7 @@ int xdp_loadbalancer(struct xdp_md *ctx) {
     return XDP_PASS;
   }
 
-  // hardcode the port number for simplicity
-
-  if (tcp->dest != bpf_htons(8000)) {
-    return XDP_PASS;
-  }
+  
 
   // conntrack: pin each connection to one backend for the lifetime of the TCP
   // session so that all three-way handshake packets and subsequent data reach
@@ -231,6 +228,10 @@ int xdp_loadbalancer(struct xdp_md *ctx) {
   struct endpoints *backend = bpf_map_lookup_elem(&backends, &backend_idx);
   if (!backend) {
     return XDP_ABORTED;
+  }
+
+  if (tcp->dest != bpf_htons(backend->port)) {
+    return XDP_PASS;
   }
 
   struct bpf_fib_lookup fib = {};

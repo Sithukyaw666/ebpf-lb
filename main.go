@@ -22,6 +22,7 @@ var (
 	ifname         string
 	loadBalancerIP string
 	backends       string
+	port           int
 )
 
 func parseIPv4(s string) (uint32, error) {
@@ -44,6 +45,7 @@ func main() {
 	flag.StringVar(&ifname, "i", "lo", "Network interface to attach eBPF programs")
 	flag.StringVar(&loadBalancerIP, "lb-ip", "", "Load Balancer Node/Real IP")
 	flag.StringVar(&backends, "backends", "", "IP addresses of backends (separated by ',')")
+	flag.IntVar(&port, "port", 8000, "Upstream port")
 	flag.Parse()
 
 	if backends == "" || loadBalancerIP == "" {
@@ -80,8 +82,9 @@ func main() {
 			log.Fatalf("Invalid backend IP %q: %v", backend, err)
 		}
 
-		backEp := lbEndpoint{
-			Ip: backIP,
+		backEp := lbEndpoints{
+			Ip:   backIP,
+			Port: uint16(port),
 		}
 
 		// Use index i as the map key to store multiple endpoints
@@ -97,7 +100,7 @@ func main() {
 		log.Fatalf("Invalid Load Balancer IP %q: %v", loadBalancerIP, err)
 	}
 
-	lbEp := lbEndpoint{
+	lbEp := lbEndpoints{
 		Ip: lbIP,
 	}
 
