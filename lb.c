@@ -2,14 +2,14 @@
 #include "vmlinux.h"
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
-
 #include "parse_helpers.h"
+
 #define NUM_BACKENDS 2
 #define ETH_ALEN 6
 #define AF_INET 2
 
 // upstream_server_ips
-struct endpoint {
+struct endpoints {
   __u32 ip;
 };
 
@@ -17,14 +17,14 @@ struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, NUM_BACKENDS);
   __type(key, __u32);
-  __type(value, struct endpoint);
+  __type(value, struct endpoints);
 } backends SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, 1);
   __type(key, __u32);
-  __type(value, struct endpoint);
+  __type(value, struct endpoints);
 } load_balancer SEC(".maps");
 
 struct {
@@ -34,19 +34,32 @@ struct {
   __type(value, __u32);
 } rr_state SEC(".maps");
 
-// return next backend pointer
-// without loop and direct lookup
-static __always_inline struct endpoint *get_next_backend() {
+// 4-tuple key for per-connection backend pinning
+struct conn_key {
+  __u32 src_ip;
+  __u32 dst_ip;
+  __u16 src_port;
+  __u16 dst_port;
+};
+
+// LRU hash: connection -> backend index
+// LRU automatically evicts oldest entry when full, no explicit TTL needed
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536);
+  __type(key, struct conn_key);
+  __type(value, __u32);
+} conntrack SEC(".maps");
+
+// return next backend index via round-robin
+static __always_inline int get_next_backend_idx(__u32 *out_idx) {
   __u32 key = 0;
   __u32 *last_idx = bpf_map_lookup_elem(&rr_state, &key);
   if (!last_idx)
-    return NULL;
-
+    return -1;
+  *out_idx = (*last_idx) % NUM_BACKENDS;
   __sync_fetch_and_add(last_idx, 1);
-
-  __u32 target_idx = (*last_idx) % NUM_BACKENDS;
-
-  return bpf_map_lookup_elem(&backends, &target_idx);
+  return 0;
 }
 // check the error type at
 // https://github.com/torvalds/linux/blob/e774d5f1bc27a85f858bce7688509e866f8e8a4e/include/uapi/linux/bpf.h#L7300
@@ -183,9 +196,39 @@ int xdp_loadbalancer(struct xdp_md *ctx) {
     return XDP_PASS;
   }
 
-  // roundrobin
-  struct endpoint *backend = get_next_backend();
+  // conntrack: pin each connection to one backend for the lifetime of the TCP
+  // session so that all three-way handshake packets and subsequent data reach
+  // the same backend
+  struct conn_key ckey = {
+    .src_ip   = ip->saddr,
+    .dst_ip   = ip->daddr,
+    .src_port = tcp->source,
+    .dst_port = tcp->dest,
+  };
 
+  __u32 backend_idx;
+  __u32 *stored_idx = bpf_map_lookup_elem(&conntrack, &ckey);
+
+  if (stored_idx) {
+    // existing connection: reuse the pinned backend
+    backend_idx = *stored_idx;
+
+    // evict on FIN or RST so the slot is freed for future connections
+    if (tcp->fin || tcp->rst)
+      bpf_map_delete_elem(&conntrack, &ckey);
+  } else {
+    // new connection: only SYN starts a valid TCP session
+    if (!tcp->syn)
+      return XDP_PASS;
+
+    // pick next backend via round-robin and pin it
+    if (get_next_backend_idx(&backend_idx) < 0)
+      return XDP_ABORTED;
+
+    bpf_map_update_elem(&conntrack, &ckey, &backend_idx, BPF_ANY);
+  }
+
+  struct endpoints *backend = bpf_map_lookup_elem(&backends, &backend_idx);
   if (!backend) {
     return XDP_ABORTED;
   }
@@ -265,7 +308,7 @@ int xdp_loadbalancer(struct xdp_md *ctx) {
       IPPROTO_IPIP; // for kernel ipip module to check and proceed decapsulation
 
   __u32 lbkey = 0;
-  struct endpoint *lb = bpf_map_lookup_elem(&load_balancer, &lbkey);
+  struct endpoints *lb = bpf_map_lookup_elem(&load_balancer, &lbkey);
   if (!lb) {
     return XDP_ABORTED;
   }
